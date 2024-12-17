@@ -30,7 +30,6 @@ import android.system.Os
 import android.system.OsConstants
 import android.system.OsConstants.AF_INET
 import android.system.OsConstants.AF_PACKET
-import android.system.OsConstants.ARPHRD_ETHER
 import android.system.OsConstants.ETH_P_IPV6
 import android.system.OsConstants.IPPROTO_UDP
 import android.system.OsConstants.SOCK_CLOEXEC
@@ -160,8 +159,7 @@ class NetworkStackUtilsIntegrationTest {
         assertArrayEquals("Sent packet != original packet", originalPacket, sentDhcpPacket)
     }
 
-    @Test
-    fun testAttachRaFilter() {
+    private fun doTestAttachRaFilter(generic: Boolean) {
         val socket = Os.socket(AF_PACKET, SOCK_RAW or SOCK_CLOEXEC, 0)
         val ifParams = InterfaceParams.getByName(iface.interfaceName)
                 ?: fail("Could not obtain interface params for ${iface.interfaceName}")
@@ -177,7 +175,11 @@ class NetworkStackUtilsIntegrationTest {
         echo.rewind()
         assertNextPacketEquals(socket, echo.readAsArray(), "ICMPv6 echo")
 
-        NetworkStackUtils.attachRaFilter(socket)
+        if (generic) {
+            NetworkStackUtils.attachControlPacketFilter(socket)
+        } else {
+            NetworkStackUtils.attachRaFilter(socket)
+        }
         // Send another echo, then an RA. After setting the filter expect only the RA.
         echo.rewind()
         reader.sendResponse(echo)
@@ -191,6 +193,16 @@ class NetworkStackUtilsIntegrationTest {
         ra.rewind()
 
         assertNextPacketEquals(socket, ra.readAsArray(), "ICMPv6 RA")
+    }
+
+    @Test
+    fun testAttachRaFilter() {
+        doTestAttachRaFilter(false)
+    }
+
+    @Test
+    fun testRaViaAttachControlPacketFilter() {
+        doTestAttachRaFilter(true)
     }
 
     private fun assertNextPacketEquals(socket: FileDescriptor, expected: ByteArray, descr: String) {
@@ -251,14 +263,15 @@ class NetworkStackUtilsIntegrationTest {
         // Don't accept the prefix length larger than 64.
         assertNull(NetworkStackUtils.createInet6AddressFromEui64(prefix, eui64))
 
+        // prefix length equals to or less than 64 is acceptable.
         prefix = IpPrefix("2001:db8:1::/48")
-        // Don't accept the prefix length less than 64.
-        assertNull(NetworkStackUtils.createInet6AddressFromEui64(prefix, eui64))
-
-        prefix = IpPrefix("2001:db8:1::/64")
         // IPv6 address string is formed by combining the IPv6 prefix("2001:db8:1::") and
         // EUI64 converted from TEST_SRC_MAC, see above test for the output EUI64 example.
-        val expected = parseNumericAddress("2001:db8:1::b898:76ff:fe54:3210") as Inet6Address
+        var expected = parseNumericAddress("2001:db8:1::b898:76ff:fe54:3210") as Inet6Address
+        assertEquals(expected, NetworkStackUtils.createInet6AddressFromEui64(prefix, eui64))
+
+        prefix = IpPrefix("2001:db8:1:2::/64")
+        expected = parseNumericAddress("2001:db8:1:2:b898:76ff:fe54:3210") as Inet6Address
         assertEquals(expected, NetworkStackUtils.createInet6AddressFromEui64(prefix, eui64))
     }
 
@@ -294,12 +307,15 @@ class NetworkStackUtilsIntegrationTest {
         packet.putShort(checksumOffset, IpUtils.ipChecksum(packet, ETHER_HEADER_LEN))
     }
 
-    @Test
-    fun testDhcpResponseWithMfBitDropped() {
+    private fun doTestDhcpResponseWithMfBitDropped(generic: Boolean) {
         val ifindex = InterfaceParams.getByName(iface.interfaceName).index
         val packetSock = Os.socket(AF_PACKET, SOCK_RAW or SOCK_NONBLOCK, /*protocol=*/0)
         try {
-            NetworkStackUtils.attachDhcpFilter(packetSock)
+            if (generic) {
+                NetworkStackUtils.attachControlPacketFilter(packetSock)
+            } else {
+                NetworkStackUtils.attachDhcpFilter(packetSock)
+            }
             val addr = SocketUtils.makePacketSocketAddress(OsConstants.ETH_P_IP, ifindex)
             Os.bind(packetSock, addr)
             val packet = DhcpPacket.buildNakPacket(DhcpPacket.ENCAP_L2, 42,
@@ -319,6 +335,16 @@ class NetworkStackUtilsIntegrationTest {
         } finally {
             Os.close(packetSock)
         }
+    }
+
+    @Test
+    fun testDhcpResponseWithMfBitDropped() {
+        doTestDhcpResponseWithMfBitDropped(false)
+    }
+
+    @Test
+    fun testGenericDhcpResponseWithMfBitDropped() {
+        doTestDhcpResponseWithMfBitDropped(true)
     }
 }
 

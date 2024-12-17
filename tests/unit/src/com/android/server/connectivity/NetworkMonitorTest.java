@@ -19,6 +19,8 @@ package com.android.server.connectivity;
 import static android.content.Intent.ACTION_CONFIGURATION_CHANGED;
 import static android.net.CaptivePortal.APP_RETURN_DISMISSED;
 import static android.net.CaptivePortal.APP_RETURN_WANTED_AS_IS;
+import static android.net.ConnectivitySettingsManager.PRIVATE_DNS_MODE_OPPORTUNISTIC;
+import static android.net.ConnectivitySettingsManager.PRIVATE_DNS_MODE_PROVIDER_HOSTNAME;
 import static android.net.DnsResolver.TYPE_A;
 import static android.net.DnsResolver.TYPE_AAAA;
 import static android.net.INetworkMonitor.NETWORK_VALIDATION_PROBE_DNS;
@@ -29,9 +31,11 @@ import static android.net.INetworkMonitor.NETWORK_VALIDATION_PROBE_PRIVDNS;
 import static android.net.INetworkMonitor.NETWORK_VALIDATION_RESULT_PARTIAL;
 import static android.net.INetworkMonitor.NETWORK_VALIDATION_RESULT_SKIPPED;
 import static android.net.INetworkMonitor.NETWORK_VALIDATION_RESULT_VALID;
+import static android.net.InetAddresses.parseNumericAddress;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED;
+import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_SUSPENDED;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VCN_MANAGED;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_OEM_PAID;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_TRUSTED;
@@ -50,6 +54,9 @@ import static android.net.util.DataStallUtils.DEFAULT_DATA_STALL_EVALUATION_TYPE
 import static android.os.Build.VERSION_CODES.S_V2;
 import static android.provider.DeviceConfig.NAMESPACE_CONNECTIVITY;
 
+import static com.android.net.module.util.DnsPacket.TYPE_SVCB;
+import static com.android.net.module.util.FeatureVersions.FEATURE_DDR_IN_CONNECTIVITY;
+import static com.android.net.module.util.FeatureVersions.FEATURE_DDR_IN_DNSRESOLVER;
 import static com.android.net.module.util.NetworkStackConstants.TEST_CAPTIVE_PORTAL_HTTPS_URL;
 import static com.android.net.module.util.NetworkStackConstants.TEST_CAPTIVE_PORTAL_HTTP_URL;
 import static com.android.net.module.util.NetworkStackConstants.TEST_URL_EXPIRATION_TIME;
@@ -61,7 +68,11 @@ import static com.android.networkstack.util.NetworkStackUtils.CAPTIVE_PORTAL_MOD
 import static com.android.networkstack.util.NetworkStackUtils.CAPTIVE_PORTAL_OTHER_FALLBACK_URLS;
 import static com.android.networkstack.util.NetworkStackUtils.CAPTIVE_PORTAL_USE_HTTPS;
 import static com.android.networkstack.util.NetworkStackUtils.DEFAULT_CAPTIVE_PORTAL_DNS_PROBE_TIMEOUT;
+import static com.android.networkstack.util.NetworkStackUtils.DNS_DDR_VERSION;
 import static com.android.networkstack.util.NetworkStackUtils.DNS_PROBE_PRIVATE_IP_NO_INTERNET_VERSION;
+import static com.android.networkstack.util.NetworkStackUtils.NETWORKMONITOR_ASYNC_PRIVDNS_RESOLUTION;
+import static com.android.networkstack.util.NetworkStackUtils.REEVALUATE_WHEN_RESUME;
+import static com.android.server.connectivity.NetworkMonitor.CONFIG_ASYNC_PRIVDNS_PROBE_TIMEOUT_MS;
 import static com.android.server.connectivity.NetworkMonitor.INITIAL_REEVALUATE_DELAY_MS;
 import static com.android.server.connectivity.NetworkMonitor.extractCharset;
 
@@ -76,6 +87,7 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.junit.Assume.assumeFalse;
 import static org.junit.Assume.assumeTrue;
+import static org.mockito.AdditionalMatchers.aryEq;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
@@ -98,7 +110,6 @@ import static org.mockito.Mockito.verify;
 
 import static java.lang.System.currentTimeMillis;
 import static java.util.Collections.singletonList;
-import static java.util.stream.Collectors.toList;
 
 import android.annotation.NonNull;
 import android.annotation.SuppressLint;
@@ -115,15 +126,17 @@ import android.net.DataStallReportParcelable;
 import android.net.DnsResolver;
 import android.net.INetd;
 import android.net.INetworkMonitorCallbacks;
-import android.net.InetAddresses;
 import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkAgentConfig;
 import android.net.NetworkCapabilities;
 import android.net.NetworkTestResultParcelable;
+import android.net.PrivateDnsConfigParcel;
 import android.net.Uri;
 import android.net.captiveportal.CaptivePortalProbeResult;
 import android.net.metrics.IpConnectivityLog;
+import android.net.metrics.NetworkEvent;
+import android.net.metrics.ValidationProbeEvent;
 import android.net.networkstack.aidl.NetworkMonitorParameters;
 import android.net.shared.PrivateDnsConfig;
 import android.net.wifi.WifiInfo;
@@ -131,9 +144,7 @@ import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.ConditionVariable;
-import android.os.Handler;
 import android.os.IBinder;
-import android.os.Looper;
 import android.os.Process;
 import android.os.RemoteException;
 import android.os.SystemClock;
@@ -145,11 +156,12 @@ import android.telephony.CellInfoGsm;
 import android.telephony.CellInfoLte;
 import android.telephony.CellSignalStrength;
 import android.telephony.TelephonyManager;
+import android.text.TextUtils;
 import android.util.ArrayMap;
 
 import androidx.test.filters.SmallTest;
-import androidx.test.runner.AndroidJUnit4;
 
+import com.android.internal.annotations.GuardedBy;
 import com.android.modules.utils.build.SdkLevel;
 import com.android.net.module.util.SharedLog;
 import com.android.networkstack.NetworkStackNotifier;
@@ -170,9 +182,11 @@ import com.android.server.NetworkStackService.NetworkStackServiceManager;
 import com.android.server.connectivity.nano.CellularData;
 import com.android.server.connectivity.nano.DnsEvent;
 import com.android.server.connectivity.nano.WifiData;
+import com.android.testutils.ConcurrentUtils;
 import com.android.testutils.DevSdkIgnoreRule;
 import com.android.testutils.DevSdkIgnoreRule.IgnoreAfter;
 import com.android.testutils.DevSdkIgnoreRule.IgnoreUpTo;
+import com.android.testutils.DevSdkIgnoreRunner;
 import com.android.testutils.HandlerUtils;
 
 import com.google.protobuf.nano.MessageNano;
@@ -187,10 +201,9 @@ import org.junit.runner.RunWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
+import org.mockito.Mockito;
 import org.mockito.MockitoAnnotations;
 import org.mockito.Spy;
-import org.mockito.invocation.InvocationOnMock;
-import org.mockito.stubbing.Answer;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -212,12 +225,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Random;
-import java.util.concurrent.Executor;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 
 import javax.net.ssl.SSLHandshakeException;
 
-@RunWith(AndroidJUnit4.class)
+@DevSdkIgnoreRunner.MonitorThreadLeak
+@RunWith(DevSdkIgnoreRunner.class)
 @SmallTest
 @SuppressLint("NewApi")  // Uses hidden APIs, which the linter would identify as missing APIs.
 public class NetworkMonitorTest {
@@ -261,8 +277,10 @@ public class NetworkMonitorTest {
     private @Mock TcpSocketTracker.Dependencies mTstDependencies;
     private @Mock INetd mNetd;
     private @Mock TcpSocketTracker mTst;
-    private HashSet<WrappedNetworkMonitor> mCreatedNetworkMonitors;
-    private HashSet<BroadcastReceiver> mRegisteredReceivers;
+    @GuardedBy("mCreatedNetworkMonitors")
+    private final HashSet<WrappedNetworkMonitor> mCreatedNetworkMonitors = new HashSet<>();
+    @GuardedBy("mRegisteredReceivers")
+    private final HashSet<BroadcastReceiver> mRegisteredReceivers = new HashSet<>();
     private @Mock Context mMccContext;
     private @Mock Resources mMccResource;
     private @Mock WifiInfo mWifiInfo;
@@ -310,6 +328,8 @@ public class NetworkMonitorTest {
     private static final NetworkAgentConfigShim TEST_AGENT_CONFIG =
             NetworkAgentConfigShimImpl.newInstance(null);
     private static final LinkProperties TEST_LINK_PROPERTIES = new LinkProperties();
+    // Each thread that runs isCaptivePortal could generate 2 more probing threads.
+    private static final int THREAD_QUIT_MAX_RETRY_COUNT = 3;
 
     // Cannot have a static member for the LinkProperties with captive portal API information, as
     // the initializer would crash on Q (the members in LinkProperties were introduced in R).
@@ -319,9 +339,16 @@ public class NetworkMonitorTest {
         return lp;
     }
 
-    private static final NetworkCapabilities CELL_METERED_CAPABILITIES = new NetworkCapabilities()
+    private static final NetworkCapabilities CELL_SUSPENDED_METERED_CAPABILITIES =
+            new NetworkCapabilities()
             .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
             .addCapability(NET_CAPABILITY_INTERNET);
+
+    private static final NetworkCapabilities CELL_METERED_CAPABILITIES =
+            new NetworkCapabilities()
+            .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
+            .addCapability(NET_CAPABILITY_INTERNET)
+            .addCapability(NET_CAPABILITY_NOT_SUSPENDED);
 
     private static final NetworkCapabilities CELL_NOT_METERED_CAPABILITIES =
             new NetworkCapabilities()
@@ -346,135 +373,12 @@ public class NetworkMonitorTest {
                 .addCapability(NET_CAPABILITY_OEM_PAID)
                 .removeCapability(NET_CAPABILITY_NOT_RESTRICTED);
 
-    /**
-     * Fakes DNS responses.
-     *
-     * Allows test methods to configure the IP addresses that will be resolved by
-     * Network#getAllByName and by DnsResolver#query.
-     */
-    class FakeDns {
-        /** Data class to record the Dns entry. */
-        class DnsEntry {
-            final String mHostname;
-            final int mType;
-            final List<InetAddress> mAddresses;
-            DnsEntry(String host, int type, List<InetAddress> addr) {
-                mHostname = host;
-                mType = type;
-                mAddresses = addr;
-            }
-            // Full match or partial match that target host contains the entry hostname to support
-            // random private dns probe hostname.
-            private boolean matches(String hostname, int type) {
-                return hostname.endsWith(mHostname) && type == mType;
-            }
-        }
-        private final ArrayList<DnsEntry> mAnswers = new ArrayList<DnsEntry>();
-        private boolean mNonBypassPrivateDnsWorking = true;
-
-        /** Whether DNS queries on mNonBypassPrivateDnsWorking should succeed. */
-        private void setNonBypassPrivateDnsWorking(boolean working) {
-            mNonBypassPrivateDnsWorking = working;
-        }
-
-        /** Clears all DNS entries. */
-        private synchronized void clearAll() {
-            mAnswers.clear();
-        }
-
-        /** Returns the answer for a given name and type on the given mock network. */
-        private synchronized List<InetAddress> getAnswer(Object mock, String hostname, int type) {
-            if (mock == mNetwork && !mNonBypassPrivateDnsWorking) {
-                return null;
-            }
-
-            return mAnswers.stream().filter(e -> e.matches(hostname, type))
-                    .map(answer -> answer.mAddresses).findFirst().orElse(null);
-        }
-
-        /** Sets the answer for a given name and type. */
-        private synchronized void setAnswer(String hostname, String[] answer, int type)
-                throws UnknownHostException {
-            DnsEntry record = new DnsEntry(hostname, type, generateAnswer(answer));
-            // Remove the existing one.
-            mAnswers.removeIf(entry -> entry.matches(hostname, type));
-            // Add or replace a new record.
-            mAnswers.add(record);
-        }
-
-        private List<InetAddress> generateAnswer(String[] answer) {
-            if (answer == null) return new ArrayList<>();
-            return Arrays.stream(answer).map(addr -> InetAddress.parseNumericAddress(addr))
-                    .collect(toList());
-        }
-
-        /** Simulates a getAllByName call for the specified name on the specified mock network. */
-        private InetAddress[] getAllByName(Object mock, String hostname)
-                throws UnknownHostException {
-            List<InetAddress> answer = queryAllTypes(mock, hostname);
-            if (answer == null || answer.size() == 0) {
-                throw new UnknownHostException(hostname);
-            }
-            return answer.toArray(new InetAddress[0]);
-        }
-
-        // Regardless of the type, depends on what the responses contained in the network.
-        private List<InetAddress> queryAllTypes(Object mock, String hostname) {
-            List<InetAddress> answer = new ArrayList<>();
-            addAllIfNotNull(answer, getAnswer(mock, hostname, TYPE_A));
-            addAllIfNotNull(answer, getAnswer(mock, hostname, TYPE_AAAA));
-            return answer;
-        }
-
-        private void addAllIfNotNull(List<InetAddress> list, List<InetAddress> c) {
-            if (c != null) {
-                list.addAll(c);
-            }
-        }
-
-        /** Starts mocking DNS queries. */
-        private void startMocking() throws UnknownHostException {
-            // Queries on mNetwork using getAllByName.
-            doAnswer(invocation -> {
-                return getAllByName(invocation.getMock(), invocation.getArgument(0));
-            }).when(mNetwork).getAllByName(any());
-
-            // Queries on mCleartextDnsNetwork using DnsResolver#query.
-            doAnswer(invocation -> {
-                return mockQuery(invocation, 1 /* posHostname */, 3 /* posExecutor */,
-                        5 /* posCallback */, -1 /* posType */);
-            }).when(mDnsResolver).query(any(), any(), anyInt(), any(), any(), any());
-
-            // Queries on mCleartextDnsNetwork using DnsResolver#query with QueryType.
-            doAnswer(invocation -> {
-                return mockQuery(invocation, 1 /* posHostname */, 4 /* posExecutor */,
-                        6 /* posCallback */, 2 /* posType */);
-            }).when(mDnsResolver).query(any(), any(), anyInt(), anyInt(), any(), any(), any());
-        }
-
-        // Mocking queries on DnsResolver#query.
-        private Answer mockQuery(InvocationOnMock invocation, int posHostname, int posExecutor,
-                int posCallback, int posType) {
-            String hostname = (String) invocation.getArgument(posHostname);
-            Executor executor = (Executor) invocation.getArgument(posExecutor);
-            DnsResolver.Callback<List<InetAddress>> callback = invocation.getArgument(posCallback);
-            List<InetAddress> answer;
-
-            answer = posType != -1
-                    ? getAnswer(invocation.getMock(), hostname, invocation.getArgument(posType)) :
-                    queryAllTypes(invocation.getMock(), hostname);
-
-            if (answer != null && answer.size() > 0) {
-                new Handler(Looper.getMainLooper()).post(() -> {
-                    executor.execute(() -> callback.onAnswer(answer, 0));
-                });
-            }
-            // If no answers, do nothing. sendDnsProbeWithTimeout will time out and throw UHE.
-            return null;
-        }
-    }
-
     private FakeDns mFakeDns;
+
+    @GuardedBy("mThreadsToBeCleared")
+    private final ArrayList<Thread> mThreadsToBeCleared = new ArrayList<>();
+    @GuardedBy("mExecutorServiceToBeCleared")
+    private final ArrayList<ExecutorService> mExecutorServiceToBeCleared = new ArrayList<>();
 
     @Before
     public void setUp() throws Exception {
@@ -490,6 +394,19 @@ public class NetworkMonitorTest {
                 .getSetting(any(), eq(Settings.Global.CAPTIVE_PORTAL_HTTP_URL), any());
         doReturn(TEST_HTTPS_URL).when(mDependencies)
                 .getSetting(any(), eq(Settings.Global.CAPTIVE_PORTAL_HTTPS_URL), any());
+        doAnswer((invocation) -> {
+            synchronized (mThreadsToBeCleared) {
+                mThreadsToBeCleared.add(invocation.getArgument(0));
+            }
+            return null;
+        }).when(mDependencies).onThreadCreated(any());
+        doAnswer((invocation) -> {
+            synchronized (mExecutorServiceToBeCleared) {
+                mExecutorServiceToBeCleared.add(invocation.getArgument(0));
+            }
+            return null;
+        }).when(mDependencies).onExecutorServiceCreated(any());
+        doReturn(mValidationLogger).when(mValidationLogger).forSubComponent(any());
 
         doReturn(mCleartextDnsNetwork).when(mNetwork).getPrivateDnsBypassingCopy();
 
@@ -519,6 +436,8 @@ public class NetworkMonitorTest {
         // it will fail the test because of timeout expired for querying AAAA and A sequentially.
         doReturn(200).when(mResources)
                 .getInteger(eq(R.integer.config_captive_portal_dns_probe_timeout));
+        doReturn(200).when(mDependencies).getDeviceConfigPropertyInt(
+                eq(NAMESPACE_CONNECTIVITY), eq(CONFIG_ASYNC_PRIVDNS_PROBE_TIMEOUT_MS), anyInt());
 
         doAnswer((invocation) -> {
             URL url = invocation.getArgument(0);
@@ -554,15 +473,9 @@ public class NetworkMonitorTest {
         initHttpConnection(mHttpConnection);
         initHttpConnection(mHttpsConnection);
         initHttpConnection(mFallbackConnection);
-        initHttpConnection(mOtherHttpConnection1);
-        initHttpConnection(mOtherHttpsConnection1);
-        initHttpConnection(mOtherHttpsConnection2);
         initHttpConnection(mOtherFallbackConnection);
-        initHttpConnection(mTestOverriddenUrlConnection);
-        initHttpConnection(mCapportApiConnection);
-        initHttpConnection(mSpeedTestConnection);
 
-        mFakeDns = new FakeDns();
+        mFakeDns = new FakeDns(mNetwork, mDnsResolver);
         mFakeDns.startMocking();
         // Set private dns suffix answer. sendPrivateDnsProbe() in NetworkMonitor send probe with
         // one time hostname. The hostname will be [random generated UUID] + HOST_SUFFIX differently
@@ -573,16 +486,22 @@ public class NetworkMonitorTest {
         mFakeDns.setAnswer(PRIVATE_DNS_PROBE_HOST_SUFFIX, new String[]{"2001:db8::1"}, TYPE_AAAA);
 
         doAnswer((invocation) -> {
-            mRegisteredReceivers.add(invocation.getArgument(0));
+            synchronized (mRegisteredReceivers) {
+                mRegisteredReceivers.add(invocation.getArgument(0));
+            }
             return new Intent();
         }).when(mContext).registerReceiver(any(BroadcastReceiver.class), any());
         doAnswer((invocation) -> {
-            mRegisteredReceivers.add(invocation.getArgument(0));
+            synchronized (mRegisteredReceivers) {
+                mRegisteredReceivers.add(invocation.getArgument(0));
+            }
             return new Intent();
         }).when(mContext).registerReceiver(any(BroadcastReceiver.class), any(), anyInt());
 
         doAnswer((invocation) -> {
-            mRegisteredReceivers.remove(invocation.getArgument(0));
+            synchronized (mRegisteredReceivers) {
+                mRegisteredReceivers.remove(invocation.getArgument(0));
+            }
             return null;
         }).when(mContext).unregisterReceiver(any());
 
@@ -592,25 +511,64 @@ public class NetworkMonitorTest {
         setDataStallEvaluationType(DATA_STALL_EVALUATION_TYPE_DNS);
         setValidDataStallDnsTimeThreshold(TEST_MIN_VALID_STALL_DNS_TIME_THRESHOLD_MS);
         setConsecutiveDnsTimeoutThreshold(5);
-        mCreatedNetworkMonitors = new HashSet<>();
-        mRegisteredReceivers = new HashSet<>();
+    }
+
+    private void quitNetworkMonitors() throws Exception {
+        ConcurrentUtils.quitResources(THREAD_QUIT_MAX_RETRY_COUNT, () -> {
+            synchronized (mCreatedNetworkMonitors) {
+                final ArrayList<WrappedNetworkMonitor> ret =
+                        new ArrayList<>(mCreatedNetworkMonitors);
+                mCreatedNetworkMonitors.clear();
+                return ret;
+            }
+        }, nm -> {
+            nm.notifyNetworkDisconnected();
+            nm.awaitQuit();
+        });
+        synchronized (mRegisteredReceivers) {
+            assertEquals("BroadcastReceiver still registered after disconnect",
+                    0, mRegisteredReceivers.size());
+        }
+        quitThreads();
+        quitExecutorServices();
+    }
+
+    private void quitExecutorServices() throws Exception {
+        ConcurrentUtils.quitExecutorServices(
+                THREAD_QUIT_MAX_RETRY_COUNT,
+                // ExecutorService should already have been terminated by NetworkMonitor.
+                false /* interrupt */,
+                HANDLER_TIMEOUT_MS,
+                () -> {
+                    synchronized (mExecutorServiceToBeCleared) {
+                        final ArrayList<ExecutorService> ret =
+                                new ArrayList<>(mExecutorServiceToBeCleared);
+                        mExecutorServiceToBeCleared.clear();
+                        return ret;
+                    }
+                });
+    }
+
+    private void quitThreads() throws Exception {
+        ConcurrentUtils.quitThreads(
+                THREAD_QUIT_MAX_RETRY_COUNT,
+                true /* interrupt */,
+                HANDLER_TIMEOUT_MS,
+                () -> {
+                    synchronized (mThreadsToBeCleared) {
+                        final ArrayList<Thread> ret = new ArrayList<>(mThreadsToBeCleared);
+                        mThreadsToBeCleared.clear();
+                        return ret;
+                    }
+                });
     }
 
     @After
-    public void tearDown() {
+    public void tearDown() throws Exception {
         mFakeDns.clearAll();
-        // Make a local copy of mCreatedNetworkMonitors because during the iteration below,
-        // WrappedNetworkMonitor#onQuitting will delete elements from it on the handler threads.
-        WrappedNetworkMonitor[] networkMonitors = mCreatedNetworkMonitors.toArray(
-                new WrappedNetworkMonitor[0]);
-        for (WrappedNetworkMonitor nm : networkMonitors) {
-            nm.notifyNetworkDisconnected();
-            nm.awaitQuit();
-        }
-        assertEquals("NetworkMonitor still running after disconnect",
-                0, mCreatedNetworkMonitors.size());
-        assertEquals("BroadcastReceiver still registered after disconnect",
-                0, mRegisteredReceivers.size());
+        quitNetworkMonitors();
+        // Clear mocks to prevent from stubs holding instances and cause memory leaks.
+        Mockito.framework().clearInlineMocks();
     }
 
     private void initHttpConnection(HttpURLConnection connection) {
@@ -693,7 +651,6 @@ public class NetworkMonitorTest {
         @Override
         protected void onQuitting() {
             super.onQuitting();
-            assertTrue(mCreatedNetworkMonitors.remove(this));
             mQuitCv.open();
         }
 
@@ -1015,7 +972,9 @@ public class NetworkMonitorTest {
         verify(mContext, never()).registerReceiver(receiverCaptor.capture(),
                 argThat(receiver -> ACTION_CONFIGURATION_CHANGED.equals(receiver.getAction(0))));
         nm.start();
-        mCreatedNetworkMonitors.add(nm);
+        synchronized (mCreatedNetworkMonitors) {
+            mCreatedNetworkMonitors.add(nm);
+        }
         HandlerUtils.waitForIdle(nm.getHandler(), HANDLER_TIMEOUT_MS);
         verify(mContext, times(1)).registerReceiver(receiverCaptor.capture(),
                 argThat(receiver -> ACTION_CONFIGURATION_CHANGED.equals(receiver.getAction(0))));
@@ -1132,33 +1091,18 @@ public class NetworkMonitorTest {
     private static CellIdentityGsm makeCellIdentityGsm(int lac, int cid, int arfcn, int bsic,
             String mccStr, String mncStr, String alphal, String alphas)
             throws ReflectiveOperationException {
-        if (ShimUtils.isAtLeastR()) {
-            return new CellIdentityGsm(lac, cid, arfcn, bsic, mccStr, mncStr, alphal, alphas,
-                    Collections.emptyList() /* additionalPlmns */);
-        } else {
-            // API <= Q does not have the additionalPlmns parameter
-            final Constructor<CellIdentityGsm> constructor = CellIdentityGsm.class.getConstructor(
-                    int.class, int.class, int.class, int.class, String.class, String.class,
-                    String.class, String.class);
-            return constructor.newInstance(lac, cid, arfcn, bsic, mccStr, mncStr, alphal, alphas);
-        }
+        // TODO: inline this call.
+        return new CellIdentityGsm(lac, cid, arfcn, bsic, mccStr, mncStr, alphal, alphas,
+                Collections.emptyList() /* additionalPlmns */);
     }
 
     private static CellIdentityLte makeCellIdentityLte(int ci, int pci, int tac, int earfcn,
             int bandwidth, String mccStr, String mncStr, String alphal, String alphas)
             throws ReflectiveOperationException {
-        if (ShimUtils.isAtLeastR()) {
-            return new CellIdentityLte(ci, pci, tac, earfcn, new int[] {} /* bands */,
-                    bandwidth, mccStr, mncStr, alphal, alphas,
-                    Collections.emptyList() /* additionalPlmns */, null /* csgInfo */);
-        } else {
-            // API <= Q does not have the additionalPlmns and csgInfo parameters
-            final Constructor<CellIdentityLte> constructor = CellIdentityLte.class.getConstructor(
-                    int.class, int.class, int.class, int.class, int.class, String.class,
-                    String.class, String.class, String.class);
-            return constructor.newInstance(ci, pci, tac, earfcn, bandwidth, mccStr, mncStr, alphal,
-                    alphas);
-        }
+        // TODO: inline this call.
+        return new CellIdentityLte(ci, pci, tac, earfcn, new int[] {} /* bands */,
+                bandwidth, mccStr, mncStr, alphal, alphas,
+                Collections.emptyList() /* additionalPlmns */, null /* csgInfo */);
     }
 
     @Test
@@ -1236,7 +1180,7 @@ public class NetworkMonitorTest {
         setPortal302(mHttpConnection);
         final String httpHost = new URL(TEST_HTTP_URL).getHost();
         mFakeDns.setAnswer(httpHost, new String[] { "2001:db8::123" }, TYPE_AAAA);
-        final InetAddress parsedPrivateAddr = InetAddresses.parseNumericAddress(privateAddr);
+        final InetAddress parsedPrivateAddr = parseNumericAddress(privateAddr);
         mFakeDns.setAnswer(httpHost, new String[] { privateAddr },
                 (parsedPrivateAddr instanceof Inet6Address) ? TYPE_AAAA : TYPE_A);
     }
@@ -2132,22 +2076,10 @@ public class NetworkMonitorTest {
         assertEquals(expectedUrl, redirectUrl);
     }
 
-
     @Test
-    public void testCaptivePortalLogin_beforeR() throws Exception {
-        assumeFalse(ShimUtils.isAtLeastR());
-        testCaptivePortalLogin(TEST_HTTP_URL);
-    }
-
-    @Test
-    public void testCaptivePortalLogin_AfterR() throws Exception {
-        assumeTrue(ShimUtils.isAtLeastR());
-        testCaptivePortalLogin(TEST_LOGIN_URL);
-    }
-
-    private void testCaptivePortalLogin(String expectedUrl) throws Exception {
+    public void testCaptivePortalLogin() throws Exception {
         final NetworkMonitor nm = makeMonitor(CELL_METERED_CAPABILITIES);
-        setupAndLaunchCaptivePortalApp(nm, expectedUrl);
+        setupAndLaunchCaptivePortalApp(nm, TEST_LOGIN_URL);
 
         // Have the app report that the captive portal is dismissed, and check that we revalidate.
         setStatus(mHttpsConnection, 204);
@@ -2162,20 +2094,9 @@ public class NetworkMonitorTest {
     }
 
     @Test
-    public void testCaptivePortalUseAsIs_beforeR() throws Exception {
-        assumeFalse(ShimUtils.isAtLeastR());
-        testCaptivePortalUseAsIs(TEST_HTTP_URL);
-    }
-
-    @Test
-    public void testCaptivePortalUseAsIs_AfterR() throws Exception {
-        assumeTrue(ShimUtils.isAtLeastR());
-        testCaptivePortalUseAsIs(TEST_LOGIN_URL);
-    }
-
-    private void testCaptivePortalUseAsIs(String expectedUrl) throws Exception {
+    public void testCaptivePortalUseAsIs() throws Exception {
         final NetworkMonitor nm = makeMonitor(CELL_METERED_CAPABILITIES);
-        setupAndLaunchCaptivePortalApp(nm, expectedUrl);
+        setupAndLaunchCaptivePortalApp(nm, TEST_LOGIN_URL);
 
         // The user decides this network is wanted as is, either by encountering an SSL error or
         // encountering an unknown scheme and then deciding to continue through the browser, or by
@@ -2196,8 +2117,7 @@ public class NetworkMonitorTest {
                         NETWORK_VALIDATION_RESULT_VALID, 0 /* probesSucceeded */));
     }
 
-    @Test
-    public void testPrivateDnsSuccess() throws Exception {
+    private void runPrivateDnsSuccessTest() throws Exception {
         setStatus(mHttpsConnection, 204);
         setStatus(mHttpConnection, 204);
 
@@ -2229,7 +2149,20 @@ public class NetworkMonitorTest {
     }
 
     @Test
-    public void testProbeStatusChanged() throws Exception {
+    public void testPrivateDnsSuccess_SyncDns() throws Exception {
+        doReturn(false).when(mDependencies).isFeatureEnabled(
+                any(), eq(NETWORKMONITOR_ASYNC_PRIVDNS_RESOLUTION));
+        runPrivateDnsSuccessTest();
+    }
+
+    @Test
+    public void testPrivateDnsSuccess_AsyncDns() throws Exception {
+        doReturn(true).when(mDependencies).isFeatureEnabled(
+                any(), eq(NETWORKMONITOR_ASYNC_PRIVDNS_RESOLUTION));
+        runPrivateDnsSuccessTest();
+    }
+
+    private void runProbeStatusChangedTest() throws Exception {
         // Set no record in FakeDns and expect validation to fail.
         setStatus(mHttpsConnection, 204);
         setStatus(mHttpConnection, 204);
@@ -2252,7 +2185,20 @@ public class NetworkMonitorTest {
     }
 
     @Test
-    public void testPrivateDnsResolutionRetryUpdate() throws Exception {
+    public void testProbeStatusChanged_SyncDns() throws Exception {
+        doReturn(false).when(mDependencies).isFeatureEnabled(
+                any(), eq(NETWORKMONITOR_ASYNC_PRIVDNS_RESOLUTION));
+        runProbeStatusChangedTest();
+    }
+
+    @Test
+    public void testProbeStatusChanged_AsyncDns() throws Exception {
+        doReturn(true).when(mDependencies).isFeatureEnabled(
+                any(), eq(NETWORKMONITOR_ASYNC_PRIVDNS_RESOLUTION));
+        runProbeStatusChangedTest();
+    }
+
+    private void runPrivateDnsResolutionRetryUpdateTest() throws Exception {
         // Set no record in FakeDns and expect validation to fail.
         setStatus(mHttpsConnection, 204);
         setStatus(mHttpConnection, 204);
@@ -2297,6 +2243,458 @@ public class NetworkMonitorTest {
     }
 
     @Test
+    public void testPrivateDnsResolutionRetryUpdate_SyncDns() throws Exception {
+        doReturn(false).when(mDependencies).isFeatureEnabled(
+                any(), eq(NETWORKMONITOR_ASYNC_PRIVDNS_RESOLUTION));
+        runPrivateDnsResolutionRetryUpdateTest();
+    }
+
+    @Test
+    public void testPrivateDnsResolutionRetryUpdate_AsyncDns() throws Exception {
+        doReturn(true).when(mDependencies).isFeatureEnabled(
+                any(), eq(NETWORKMONITOR_ASYNC_PRIVDNS_RESOLUTION));
+        runPrivateDnsResolutionRetryUpdateTest();
+    }
+
+    @Test
+    public void testAsyncPrivateDnsResolution_PartialTimeout() throws Exception {
+        doReturn(true).when(mDependencies).isFeatureEnabled(
+                any(), eq(NETWORKMONITOR_ASYNC_PRIVDNS_RESOLUTION));
+        setStatus(mHttpsConnection, 204);
+        setStatus(mHttpConnection, 204);
+
+        WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
+        wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig("dns.google", new InetAddress[0]));
+
+        // Only provide AAAA answer
+        mFakeDns.setAnswer("dns.google", new String[]{"2001:db8::1"}, TYPE_AAAA);
+
+        notifyNetworkConnected(wnm, CELL_NOT_METERED_CAPABILITIES);
+        verifyNetworkTestedValidFromPrivateDns(1 /* interactions */);
+
+        final PrivateDnsConfigParcel expectedConfig = new PrivateDnsConfigParcel();
+        expectedConfig.hostname = "dns.google";
+        expectedConfig.ips = new String[] {"2001:db8::1"};
+        expectedConfig.privateDnsMode = PRIVATE_DNS_MODE_PROVIDER_HOSTNAME;
+
+        verify(mCallbacks).notifyPrivateDnsConfigResolved(expectedConfig);
+    }
+
+    @Test
+    public void testAsyncPrivateDnsResolution_PartialFailure() throws Exception {
+        doReturn(true).when(mDependencies).isFeatureEnabled(
+                any(), eq(NETWORKMONITOR_ASYNC_PRIVDNS_RESOLUTION));
+        setStatus(mHttpsConnection, 204);
+        setStatus(mHttpConnection, 204);
+
+        WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
+        wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig("dns.google", new InetAddress[0]));
+
+        // A succeeds, AAAA fails
+        mFakeDns.setAnswer("dns.google", new String[]{"192.0.2.123"}, TYPE_A);
+        mFakeDns.setAnswer("dns.google", () -> {
+            // DnsResolver.DnsException constructor is T+, so use a mock instead
+            throw mock(DnsResolver.DnsException.class);
+        }, TYPE_AAAA);
+
+        notifyNetworkConnected(wnm, CELL_NOT_METERED_CAPABILITIES);
+        verifyNetworkTestedValidFromPrivateDns(1 /* interactions */);
+
+        final PrivateDnsConfigParcel expectedConfig = new PrivateDnsConfigParcel();
+        expectedConfig.hostname = "dns.google";
+        expectedConfig.ips = new String[] {"192.0.2.123"};
+        expectedConfig.privateDnsMode = PRIVATE_DNS_MODE_PROVIDER_HOSTNAME;
+
+        verify(mCallbacks).notifyPrivateDnsConfigResolved(expectedConfig);
+    }
+
+    @Test
+    public void testAsyncPrivateDnsResolution_AQuerySucceedsFirst_PrioritizeAAAA()
+            throws Exception {
+        doReturn(true).when(mDependencies).isFeatureEnabled(
+                any(), eq(NETWORKMONITOR_ASYNC_PRIVDNS_RESOLUTION));
+        setStatus(mHttpsConnection, 204);
+        setStatus(mHttpConnection, 204);
+
+        WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
+        wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig("dns.google", new InetAddress[0]));
+
+        final ConditionVariable v4Queried = new ConditionVariable();
+        mFakeDns.setAnswer("dns.google", () -> {
+            v4Queried.open();
+            return new String[]{"192.0.2.123"};
+        }, TYPE_A);
+        mFakeDns.setAnswer("dns.google", () -> {
+            // Make sure the v6 query processing is a bit slower than the v6 one. The small delay
+            // below still does not guarantee that the v4 query will complete first, but it should
+            // the large majority of the time, which should be enough to test it. Even if it does
+            // not, the test should pass.
+            v4Queried.block(HANDLER_TIMEOUT_MS);
+            SystemClock.sleep(10L);
+            return new String[]{"2001:db8::1", "2001:db8::2"};
+        }, TYPE_AAAA);
+
+        notifyNetworkConnected(wnm, CELL_NOT_METERED_CAPABILITIES);
+        verifyNetworkTestedValidFromPrivateDns(1 /* interactions */);
+
+        final PrivateDnsConfigParcel expectedConfig = new PrivateDnsConfigParcel();
+        expectedConfig.hostname = "dns.google";
+        // The IPv6 addresses are still first
+        expectedConfig.ips = new String[] {"2001:db8::1", "2001:db8::2", "192.0.2.123"};
+        expectedConfig.privateDnsMode = PRIVATE_DNS_MODE_PROVIDER_HOSTNAME;
+
+        verify(mCallbacks).notifyPrivateDnsConfigResolved(expectedConfig);
+    }
+
+    @Test
+    public void testAsyncPrivateDnsResolution_ConfigChange_RestartsWithNewConfig()
+            throws Exception {
+        doReturn(true).when(mDependencies).isFeatureEnabled(
+                any(), eq(NETWORKMONITOR_ASYNC_PRIVDNS_RESOLUTION));
+        setStatus(mHttpsConnection, 204);
+        setStatus(mHttpConnection, 204);
+
+        WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
+        wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig("v1.google", new InetAddress[0]));
+
+        final ConditionVariable blockReplies = new ConditionVariable();
+        final CountDownLatch queriedLatch = new CountDownLatch(2);
+        mFakeDns.setAnswer("v1.google", () -> {
+            queriedLatch.countDown();
+            blockReplies.block(HANDLER_TIMEOUT_MS);
+            return new String[]{"192.0.2.123"};
+        }, TYPE_A);
+        mFakeDns.setAnswer("v1.google", () -> {
+            queriedLatch.countDown();
+            blockReplies.block(HANDLER_TIMEOUT_MS);
+            return new String[]{"2001:db8::1"};
+        }, TYPE_AAAA);
+
+        notifyNetworkConnected(wnm, CELL_NOT_METERED_CAPABILITIES);
+
+        queriedLatch.await(HANDLER_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+
+        // Send config update while DNS queries are in flight
+        mFakeDns.setAnswer("v2.google", new String[] { "192.0.2.124" }, TYPE_A);
+        mFakeDns.setAnswer("v2.google", new String[] { "2001:db8::2" }, TYPE_AAAA);
+        wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig("v2.google", new InetAddress[0]));
+
+        // Let the original queries finish. Once DNS queries finish results are posted to the
+        // handler, so they will be processed on the handler after the DNS settings change.
+        blockReplies.open();
+
+        // Expect only callbacks for the 2nd configuration
+        verifyNetworkTestedValidFromPrivateDns(1 /* interactions */);
+
+        final PrivateDnsConfigParcel expectedConfig = new PrivateDnsConfigParcel();
+        expectedConfig.hostname = "v2.google";
+        expectedConfig.ips = new String[] {"2001:db8::2", "192.0.2.124"};
+        expectedConfig.privateDnsMode = PRIVATE_DNS_MODE_PROVIDER_HOSTNAME;
+
+        verify(mCallbacks).notifyPrivateDnsConfigResolved(expectedConfig);
+    }
+
+    @Test
+    public void testAsyncPrivateDnsResolution_TurnOffStrictMode_SkipsDnsValidation()
+            throws Exception {
+        doReturn(true).when(mDependencies).isFeatureEnabled(
+                any(), eq(NETWORKMONITOR_ASYNC_PRIVDNS_RESOLUTION));
+        setStatus(mHttpsConnection, 204);
+        setStatus(mHttpConnection, 204);
+
+        WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
+        wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig("v1.google", new InetAddress[0]));
+
+        final ConditionVariable blockReplies = new ConditionVariable();
+        final CountDownLatch queriedLatch = new CountDownLatch(2);
+        mFakeDns.setAnswer("v1.google", () -> {
+            queriedLatch.countDown();
+            blockReplies.block(HANDLER_TIMEOUT_MS);
+            return new String[]{"192.0.2.123"};
+        }, TYPE_A);
+        mFakeDns.setAnswer("v1.google", () -> {
+            queriedLatch.countDown();
+            blockReplies.block(HANDLER_TIMEOUT_MS);
+            return new String[]{"2001:db8::1"};
+        }, TYPE_AAAA);
+
+        notifyNetworkConnected(wnm, CELL_NOT_METERED_CAPABILITIES);
+
+        queriedLatch.await(HANDLER_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+
+        // Send config update while DNS queries are in flight
+        wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig(true /* useTls */));
+
+        // Let the original queries finish. Once DNS queries finish results are posted to the
+        // handler, so they will be processed on the handler after the DNS settings change.
+        blockReplies.open();
+
+        verifyNetworkTestedValidFromHttps(1 /* interactions */);
+        verify(mCallbacks, never()).notifyPrivateDnsConfigResolved(any());
+    }
+
+    private void setDdrEnabledForTest() {
+        doReturn(true).when(mDependencies).isFeatureEnabled(any(),
+                eq(NETWORKMONITOR_ASYNC_PRIVDNS_RESOLUTION));
+        doReturn(true).when(mDependencies).isFeatureEnabled(any(), eq(DNS_DDR_VERSION));
+        doReturn(true).when(mDependencies).isFeatureSupported(any(),
+                eq(FEATURE_DDR_IN_CONNECTIVITY));
+        doReturn(true).when(mDependencies).isFeatureSupported(any(),
+                eq(FEATURE_DDR_IN_DNSRESOLVER));
+    }
+
+    @Test
+    public void testPrivateDnsDiscoveryWithDdr_dnsServerChange() throws Exception {
+        setDdrEnabledForTest();
+        LinkProperties lp = new LinkProperties(TEST_LINK_PROPERTIES);
+        final String svcb1 = "1 dot.google alpn=dot ipv4hint=192.0.2.1";
+        final String svcb2 = "2 doh.google alpn=h2,h3 port=443 ipv4hint=192.0.2.100 "
+                + "ipv6hint=2001:db8::100 dohpath=/dns-query{?dns}";
+        setStatus(mHttpsConnection, 204);
+        setStatus(mHttpConnection, 204);
+        mFakeDns.setAnswer("_dns.resolver.arpa", new String[] { svcb1, svcb2 }, TYPE_SVCB);
+
+        WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
+        wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig(true));
+        notifyNetworkConnected(wnm, CELL_NOT_METERED_CAPABILITIES);
+        verifyNetworkTestedValidFromHttps(1);
+        // The network just got connected. Verify the callback.
+        // Expect that `dohIps` is empty since there's no DNS on the network.
+        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1)).notifyPrivateDnsConfigResolved(
+                matchPrivateDnsConfigParcelWithDohOnly("doh.google" /* dohName */,
+                        new String[0] /* dohIps */, "/dns-query{?dns}" /* dohPath */,
+                        443 /* dohPort */));
+
+        // Add some DNS servers. Verify the callback.
+        assertTrue(lp.addDnsServer(InetAddress.parseNumericAddress("192.0.2.100")));
+        assertTrue(lp.addDnsServer(InetAddress.parseNumericAddress("2001:db8::100")));
+        wnm.notifyLinkPropertiesChanged(lp);
+        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1)).notifyPrivateDnsConfigResolved(
+                matchPrivateDnsConfigParcelWithDohOnly("doh.google" /* dohName */,
+                        new String[] { "192.0.2.100", "2001:db8::100" } /* dohIps */,
+                        "/dns-query{?dns}" /* dohPath */, 443 /* dohPort */));
+
+        // Verify that the callback is not fired if there is no DNS servers change.
+        // The number of the invoke callbacks remains 2.
+        wnm.notifyLinkPropertiesChanged(lp);
+        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(2))
+                .notifyPrivateDnsConfigResolved(any());
+
+        // Remove a DNS server. Verify the callback.
+        assertTrue(lp.removeDnsServer(InetAddress.parseNumericAddress("2001:db8::100")));
+        wnm.notifyLinkPropertiesChanged(lp);
+        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1)).notifyPrivateDnsConfigResolved(
+                matchPrivateDnsConfigParcelWithDohOnly("doh.google" /* dohName */,
+                        new String[] { "192.0.2.100" } /* dohIps */,
+                        "/dns-query{?dns}" /* dohPath */, 443 /* DohPort */));
+    }
+
+    @Test
+    public void testPrivateDnsDiscoveryWithDdr_privateDnsModeChange() throws Exception {
+        setDdrEnabledForTest();
+        final String svcb1 = "1 some.dot.name alpn=dot ipv4hint=192.0.1.100";
+        final String svcb2 = "1 some.doh.name alpn=h3 port=443 ipv4hint=192.0.2.1,192.0.2.100 "
+                + "ipv6hint=2001:db8::1,2001:db8::100 dohpath=/dns-query{?dns}";
+        setStatus(mHttpsConnection, 204);
+        setStatus(mHttpConnection, 204);
+        mFakeDns.setAnswer("_dns.resolver.arpa", new String[] { svcb2 }, TYPE_SVCB);
+        mFakeDns.setAnswer("_dns.dot.google", new String[] { svcb1 }, TYPE_SVCB);
+        mFakeDns.setAnswer("_dns.doh.google", new String[] { svcb2 }, TYPE_SVCB);
+        mFakeDns.setAnswer("dot.google", new String[] { "2001:db8::853" }, TYPE_AAAA);
+        mFakeDns.setAnswer("doh.google", new String[] { "2001:db8::854" }, TYPE_AAAA);
+
+        WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
+        wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig(true));
+        notifyNetworkConnected(wnm, CELL_NOT_METERED_CAPABILITIES);
+        verifyNetworkTestedValidFromHttps(1);
+        // The network just got connected. Verify the callback.
+        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1)).notifyPrivateDnsConfigResolved(
+                matchPrivateDnsConfigParcelWithDohOnly("some.doh.name" /* dohName */,
+                        new String[0] /* dohIps */, "/dns-query{?dns}" /* dohPath */,
+                        443 /* dohPort */));
+
+        // Change the mode to off mode. The callback is not fired.
+        // The number of invoked callbacks remains 1.
+        wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig(false));
+        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1))
+                .notifyPrivateDnsConfigResolved(any());
+
+        // Change the mode to opportunistic mode. Verify the callback.
+        wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig(true));
+        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1)).notifyPrivateDnsConfigResolved(
+                matchPrivateDnsConfigParcelWithDohOnly("some.doh.name" /* dohName */,
+                        new String[0] /* dohIps */, "/dns-query{?dns}" /* dohPath */,
+                        443 /* dohPort */));
+
+        // Change the mode to strict mode. Verify the callback.
+        wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig("dot.google", new InetAddress[0]));
+        verifyNetworkTestedValidFromPrivateDns(1);
+        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).atLeast(1)).notifyPrivateDnsConfigResolved(
+                matchPrivateDnsConfigParcelWithDotOnly("dot.google" /* hostname */,
+                        new String[] { "2001:db8::853" } /* dotIps */));
+
+        // Change the hostname of the setting. Verify the callback.
+        wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig("doh.google", new InetAddress[0]));
+        verifyNetworkTestedValidFromPrivateDns(2);
+        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).atLeast(1)).notifyPrivateDnsConfigResolved(
+                matchPrivateDnsConfigParcel("doh.google" /* hostname */,
+                        new String[] { "2001:db8::854" } /* dotIps */,
+                        "doh.google" /* dohName */,
+                        new String[] { "192.0.2.1", "192.0.2.100", "2001:db8::1",
+                                "2001:db8::100" } /* dohIps */,
+                        "/dns-query{?dns}" /* dohPath */, 443 /* dohPort */));
+    }
+
+    @Test
+    public void testPrivateDnsDiscoveryWithDdr_h3NotSupported() throws Exception {
+        setDdrEnabledForTest();
+        final String svcb = "1 doh.google alpn=h2 ipv4hint=192.0.2.100 dohpath=/dns-query{?dns}";
+        setStatus(mHttpsConnection, 204);
+        setStatus(mHttpConnection, 204);
+        mFakeDns.setAnswer("_dns.resolver.arpa", new String[] { svcb }, TYPE_SVCB);
+        mFakeDns.setAnswer("_dns.dns.google", new String[] { svcb }, TYPE_SVCB);
+        mFakeDns.setAnswer("dns.google", new String[] { "2001:db8::853" }, TYPE_AAAA);
+
+        WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
+        wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig("dns.google", new InetAddress[0]));
+        notifyNetworkConnected(wnm, CELL_NOT_METERED_CAPABILITIES);
+        verifyNetworkTestedValidFromPrivateDns(1);
+        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).atLeast(1)).notifyPrivateDnsConfigResolved(
+                matchPrivateDnsConfigParcelWithDotOnly("dns.google" /* hostname */,
+                        new String[] { "2001:db8::853" } /* dotIps */));
+    }
+
+    @Test
+    public void testPrivateDnsDiscoveryWithDdr_svcbLookupError() throws Exception {
+        setDdrEnabledForTest();
+        setStatus(mHttpsConnection, 204);
+        setStatus(mHttpConnection, 204);
+        mFakeDns.setAnswer("dns.google", new String[] { "2001:db8::1" }, TYPE_AAAA);
+        mFakeDns.setAnswer("_dns.dns.google", () -> {
+            throw mock(DnsResolver.DnsException.class); }, TYPE_SVCB);
+        mFakeDns.setAnswer("_dns.resolver.arpa", () -> {
+            throw mock(DnsResolver.DnsException.class); }, TYPE_SVCB);
+
+        // In opportunistic mode, DoH is not used if the SVCB lookup fails or times out.
+        WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
+        wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig(true));
+        notifyNetworkConnected(wnm, CELL_NOT_METERED_CAPABILITIES);
+        verifyNetworkTestedValidFromHttps(1);
+        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS)).notifyPrivateDnsConfigResolved(
+                matchPrivateDnsConfigParcelWithDotOnly("" /* hostname */,
+                        new String[] {} /* dotIps */));
+
+        // In strict mode, DoH not used if the SVCB lookup fails or times out.
+        wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig("dns.google", new InetAddress[0]));
+        verifyNetworkTestedValidFromPrivateDns(1);
+        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1)).notifyPrivateDnsConfigResolved(
+                matchPrivateDnsConfigParcelWithDotOnly("dns.google" /* hostname */,
+                        new String[] { "2001:db8::1" } /* dotIps */));
+    }
+
+    @Test
+    public void testPrivateDnsDiscoveryWithDdr_retryForReevaluation() throws Exception {
+        setDdrEnabledForTest();
+        final String svcb = "1 doh.google alpn=h3 ipv4hint=192.0.2.100 dohpath=/dns-query{?dns}";
+        setStatus(mHttpsConnection, 204);
+        setStatus(mHttpConnection, 204);
+        mFakeDns.setAnswer("_dns.resolver.arpa", new String[] { svcb }, TYPE_SVCB);
+        mFakeDns.setAnswer("_dns.dns.google", new String[] { svcb }, TYPE_SVCB);
+        mFakeDns.setAnswer("dns.google", new String[] { "2001:db8::853" }, TYPE_AAAA);
+
+        // Verify the callback for opportunistic mode.
+        WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
+        wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig(true));
+        notifyNetworkConnected(wnm, CELL_NOT_METERED_CAPABILITIES);
+        verifyNetworkTestedValidFromHttps(1);
+        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(1)).notifyPrivateDnsConfigResolved(
+                matchPrivateDnsConfigParcelWithDohOnly("doh.google" /* dohName */,
+                        new String[0] /* dohIps */, "/dns-query{?dns}" /* dohPath */,
+                        -1 /* dohPort */));
+
+        // Re-evaluation triggers DDR even in opportunistic mode.
+        wnm.forceReevaluation(Process.myUid());
+        verifyNetworkTestedValidFromHttps(2);
+        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).times(2))
+                .notifyPrivateDnsConfigResolved(any());
+
+        // Verify the callback for strict mode.
+        wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig("dns.google", new InetAddress[0]));
+        verifyNetworkTestedValidFromPrivateDns(1);
+        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).atLeast(1)).notifyPrivateDnsConfigResolved(
+                matchPrivateDnsConfigParcel("dns.google" /* hostname */,
+                        new String[] { "2001:db8::853" } /* dotIps */, "dns.google" /* dohName */,
+                        new String[] { "192.0.2.100" } /* dohIps */,
+                        "/dns-query{?dns}" /* dohPath */, -1 /* dohPort */));
+
+        // Reevaluation triggers DDR.
+        wnm.forceReevaluation(Process.myUid());
+        verifyNetworkTestedValidFromPrivateDns(2);
+        verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).atLeastOnce())
+                .notifyPrivateDnsConfigResolved(matchPrivateDnsConfigParcel(
+                        "dns.google" /* hostname */, new String[] { "2001:db8::853" } /* dotIps */,
+                        "dns.google" /* dohName */, new String[] { "192.0.2.100" } /* dohIps */,
+                        "/dns-query{?dns}" /* dohPath */, -1 /* dohPort */));
+    }
+
+    @Test
+    public void testReevaluationInterval_networkResume() throws Exception {
+        // Setup nothing and expect validation to fail.
+        doReturn(true).when(mDependencies).isFeatureEnabled(any(), eq(REEVALUATE_WHEN_RESUME));
+        final NetworkMonitor nm = runFailedNetworkTest();
+        verifyNetworkTested(VALIDATION_RESULT_INVALID, 0 /* probesSucceeded */,
+                1 /* interactions */);
+        // Reevaluation delay doubled right after 1st validation failure.
+        assertEquals(INITIAL_REEVALUATE_DELAY_MS * 2, nm.getReevaluationDelayMs());
+
+        // Suspend the network. Verify re-evaluation count does not increase.
+        setNetworkCapabilities(nm, CELL_SUSPENDED_METERED_CAPABILITIES);
+        verifyNetworkTested(VALIDATION_RESULT_INVALID, 0 /* probesSucceeded */,
+                1 /* interactions */);
+        // Verify the count does not increase.
+        assertEquals(INITIAL_REEVALUATE_DELAY_MS * 2, nm.getReevaluationDelayMs());
+
+        // Resume the network, verify re-evaluation runs immediately and the timer resets.
+        setNetworkCapabilities(nm, CELL_METERED_CAPABILITIES);
+        // Wait for another idle to prevent from flaky because the handler fires another message
+        // to re-evaluate.
+        HandlerUtils.waitForIdle(nm.getHandler(), HANDLER_TIMEOUT_MS);
+        assertEquals(INITIAL_REEVALUATE_DELAY_MS, nm.getReevaluationDelayMs());
+        verifyNetworkTested(VALIDATION_RESULT_INVALID, 0 /* probesSucceeded */,
+                2 /* interactions */);
+    }
+
+    @Test
+    public void testReevaluationInterval_verifiedNetwork() throws Exception {
+        final WrappedNetworkMonitor wnm = prepareValidatedStateNetworkMonitor(
+                CELL_METERED_CAPABILITIES);
+        assertEquals(INITIAL_REEVALUATE_DELAY_MS, wnm.getReevaluationDelayMs());
+
+        // Suspend the network. Verify re-evaluation count does not increase.
+        setNetworkCapabilities(wnm, CELL_SUSPENDED_METERED_CAPABILITIES);
+        verifyNetworkTestedValidFromHttps(1 /* interactions */);
+        assertEquals(INITIAL_REEVALUATE_DELAY_MS, wnm.getReevaluationDelayMs());
+
+        // Resume the network. Verify re-evaluation count does not increase.
+        setNetworkCapabilities(wnm, CELL_METERED_CAPABILITIES);
+        verifyNetworkTestedValidFromHttps(1 /* interactions */);
+        assertEquals(INITIAL_REEVALUATE_DELAY_MS, wnm.getReevaluationDelayMs());
+    }
+
+    @Test
+    public void testTcpSocketTracker_setCapabilities() throws Exception {
+        setDataStallEvaluationType(DATA_STALL_EVALUATION_TYPE_TCP);
+        final InOrder inOrder = inOrder(mTst);
+        final WrappedNetworkMonitor wnm = prepareValidatedStateNetworkMonitor(
+                CELL_METERED_CAPABILITIES);
+        inOrder.verify(mTst).setNetworkCapabilities(eq(CELL_METERED_CAPABILITIES));
+
+        // Suspend the network. Verify the capabilities would be passed to TcpSocketTracker.
+        setNetworkCapabilities(wnm, CELL_SUSPENDED_METERED_CAPABILITIES);
+        inOrder.verify(mTst).setNetworkCapabilities(eq(CELL_SUSPENDED_METERED_CAPABILITIES));
+    }
+
+    @Test
     public void testDataStall_setOpportunisticMode() {
         setDataStallEvaluationType(DATA_STALL_EVALUATION_TYPE_TCP);
         WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
@@ -2335,7 +2733,7 @@ public class NetworkMonitorTest {
     private void testDataStall_StallDnsSuspectedAndSendMetrics(int transport,
             NetworkCapabilities nc) throws Exception {
         // NM suspects data stall from DNS signal and sends data stall metrics.
-        final WrappedNetworkMonitor nm = prepareNetworkMonitorForVerifyDataStall(nc);
+        final WrappedNetworkMonitor nm = prepareValidatedStateNetworkMonitor(nc);
         makeDnsTimeoutEvent(nm, 5);
         // Trigger a dns signal to start evaluate data stall and upload metrics.
         nm.notifyDnsResponse(RETURN_CODE_DNS_TIMEOUT);
@@ -2345,7 +2743,7 @@ public class NetworkMonitorTest {
 
     @Test
     public void testDataStall_NoStallSuspectedAndSendMetrics() throws Exception {
-        final WrappedNetworkMonitor nm = prepareNetworkMonitorForVerifyDataStall(
+        final WrappedNetworkMonitor nm = prepareValidatedStateNetworkMonitor(
                 CELL_METERED_CAPABILITIES);
         // Setup no data stall dns signal.
         makeDnsTimeoutEvent(nm, 3);
@@ -2367,12 +2765,11 @@ public class NetworkMonitorTest {
 
     private void testDataStall_StallTcpSuspectedAndSendMetrics(NetworkCapabilities nc)
             throws Exception {
-        assumeTrue(ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q));
         setupTcpDataStall();
-        setTcpPollingInterval(0);
+        setTcpPollingInterval(1);
         // NM suspects data stall from TCP signal and sends data stall metrics.
         setDataStallEvaluationType(DATA_STALL_EVALUATION_TYPE_TCP);
-        final WrappedNetworkMonitor nm = prepareNetworkMonitorForVerifyDataStall(nc);
+        final WrappedNetworkMonitor nm = prepareValidatedStateNetworkMonitor(nc);
         // Trigger a tcp event immediately.
         nm.sendTcpPollingEvent();
         // Allow only one transport type in the context of this test for simplification.
@@ -2381,7 +2778,7 @@ public class NetworkMonitorTest {
         verifySendDataStallDetectionStats(nm, DATA_STALL_EVALUATION_TYPE_TCP, transports[0]);
     }
 
-    private WrappedNetworkMonitor prepareNetworkMonitorForVerifyDataStall(NetworkCapabilities nc)
+    private WrappedNetworkMonitor prepareValidatedStateNetworkMonitor(NetworkCapabilities nc)
             throws Exception {
         // Connect a VALID network to simulate the data stall detection because data stall
         // evaluation will only start from validated state.
@@ -2418,7 +2815,9 @@ public class NetworkMonitorTest {
                 ArgumentCaptor.forClass(CaptivePortalProbeResult.class);
         final ArgumentCaptor<DataStallDetectionStats> statsCaptor =
                 ArgumentCaptor.forClass(DataStallDetectionStats.class);
-        verify(mDependencies, timeout(HANDLER_TIMEOUT_MS).times(1))
+        // TCP data stall detection may be triggered more than once because NM stays in the
+        // ValidatedState and polling timer is set to 0.
+        verify(mDependencies, timeout(HANDLER_TIMEOUT_MS).atLeast(1))
                 .writeDataStallDetectionStats(statsCaptor.capture(), probeResultCaptor.capture());
         // Ensure probe will not stop due to rate-limiting mechanism.
         nm.setLastProbeTime(SystemClock.elapsedRealtime() - STALL_EXPECTED_LAST_PROBE_TIME_MS);
@@ -2573,26 +2972,22 @@ public class NetworkMonitorTest {
 
     @Test
     public void testCollectDataStallMetrics_TcpWithCellular() {
-        assumeTrue(ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q));
         testDataStallMetricsWithCellular(DATA_STALL_EVALUATION_TYPE_TCP);
     }
 
     @Test
     public void testCollectDataStallMetrics_TcpWithWiFi() {
-        assumeTrue(ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q));
         testDataStallMetricsWithWiFi(DATA_STALL_EVALUATION_TYPE_TCP);
     }
 
     @Test
     public void testCollectDataStallMetrics_TcpAndDnsWithWifi() {
-        assumeTrue(ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q));
         testDataStallMetricsWithWiFi(
                 DATA_STALL_EVALUATION_TYPE_TCP | DATA_STALL_EVALUATION_TYPE_DNS);
     }
 
     @Test
     public void testCollectDataStallMetrics_TcpAndDnsWithCellular() {
-        assumeTrue(ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q));
         testDataStallMetricsWithCellular(
                 DATA_STALL_EVALUATION_TYPE_TCP | DATA_STALL_EVALUATION_TYPE_DNS);
     }
@@ -2668,8 +3063,8 @@ public class NetworkMonitorTest {
         } catch (UnknownHostException e) {
         }
 
-        mFakeDns.setAnswer("www.android.com", null, TYPE_A);
-        mFakeDns.setAnswer("www.android.com", null, TYPE_AAAA);
+        mFakeDns.setAnswer("www.android.com", (String[]) null, TYPE_A);
+        mFakeDns.setAnswer("www.android.com", (String[]) null, TYPE_AAAA);
         try {
             wnm.sendDnsProbeWithTimeout("www.android.com", shortTimeoutMs);
             fail("DNS query timed out, expected UnknownHostException");
@@ -2679,19 +3074,17 @@ public class NetworkMonitorTest {
 
     @Test
     public void testNotifyNetwork_WithforceReevaluation() throws Exception {
+        // Set validated result for both HTTP and HTTPS probes.
         setValidProbes();
         final NetworkMonitor nm = runValidatedNetworkTest();
         // Verify forceReevaluation will not reset the validation result but only probe result until
         // getting the validation result.
         setSslException(mHttpsConnection);
-        setStatus(mHttpConnection, 500);
-        setStatus(mFallbackConnection, 204);
         nm.forceReevaluation(Process.myUid());
         // Expect to send HTTP, HTTPs, FALLBACK and evaluation results.
-        verifyNetworkTested(VALIDATION_RESULT_INVALID,
-                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_FALLBACK,
+        verifyNetworkTested(NETWORK_VALIDATION_RESULT_PARTIAL,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTP,
                 1 /* interactions */);
-        HandlerUtils.waitForIdle(nm.getHandler(), HANDLER_TIMEOUT_MS);
     }
 
     @Test
@@ -2713,28 +3106,19 @@ public class NetworkMonitorTest {
 
     @Test
     public void testDismissPortalInValidatedNetworkEnabledOsSupported() throws Exception {
-        assumeTrue(ShimUtils.isAtLeastR());
         testDismissPortalInValidatedNetworkEnabled(TEST_LOGIN_URL, TEST_LOGIN_URL);
     }
 
     @Test
     public void testDismissPortalInValidatedNetworkEnabledOsSupported_NullLocationUrl()
             throws Exception {
-        assumeTrue(ShimUtils.isAtLeastR());
         testDismissPortalInValidatedNetworkEnabled(TEST_HTTP_URL, null /* locationUrl */);
     }
 
     @Test
     public void testDismissPortalInValidatedNetworkEnabledOsSupported_InvalidLocationUrl()
             throws Exception {
-        assumeTrue(ShimUtils.isAtLeastR());
         testDismissPortalInValidatedNetworkEnabled(TEST_HTTP_URL, TEST_RELATIVE_URL);
-    }
-
-    @Test
-    public void testDismissPortalInValidatedNetworkEnabledOsNotSupported() throws Exception {
-        assumeFalse(ShimUtils.isAtLeastR());
-        testDismissPortalInValidatedNetworkEnabled(TEST_HTTP_URL, TEST_LOGIN_URL);
     }
 
     private void testDismissPortalInValidatedNetworkEnabled(String expectedUrl, String locationUrl)
@@ -2828,6 +3212,101 @@ public class NetworkMonitorTest {
         verifyNetworkTested(VALIDATION_RESULT_INVALID,
                 NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTP,
                 TEST_REDIRECT_URL, 1 /* interactions */);
+    }
+
+    private void doLegacyConnectivityLogTest() throws Exception {
+        mFakeDns.setAnswer("www.google.com", () -> {
+            // Make sure the DNS probes take at least 1ms
+            SystemClock.sleep(1);
+            return new String[]{"2001:db8::443"};
+        }, TYPE_AAAA);
+        mFakeDns.setAnswer(PRIVATE_DNS_PROBE_HOST_SUFFIX, () -> {
+            SystemClock.sleep(1);
+            return new String[]{"2001:db8::444"};
+        }, TYPE_AAAA);
+        setStatus(mHttpsConnection, 204);
+        setStatus(mHttpConnection, 204);
+
+        mFakeDns.setAnswer("dns6.google", new String[]{"2001:db8::53"}, TYPE_AAAA);
+        WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
+        wnm.notifyPrivateDnsSettingsChanged(new PrivateDnsConfig("dns6.google",
+                new InetAddress[0]));
+        notifyNetworkConnected(wnm, CELL_NOT_METERED_CAPABILITIES);
+        verifyNetworkTestedValidFromPrivateDns(1 /* interactions */);
+
+
+        final ArgumentCaptor<IpConnectivityLog.Event> eventCaptor =
+                ArgumentCaptor.forClass(IpConnectivityLog.Event.class);
+        verify(mLogger, atLeastOnce()).log(eq(mCleartextDnsNetwork),
+                aryEq(CELL_METERED_CAPABILITIES.getTransportTypes()),
+                eventCaptor.capture());
+
+        final List<IpConnectivityLog.Event> events = eventCaptor.getAllValues();
+        final String msg = "Did not find the expected event; events are " + events;
+
+        final int firstValidation = 1 << 8;
+
+        assertHasEvent(msg, NetworkEvent.class, events, 0,
+                e -> e.eventType == NetworkEvent.NETWORK_CONNECTED);
+
+        final int probesStartIndex = 1;
+        assertHasEvent(msg, ValidationProbeEvent.class, events, probesStartIndex,
+                e -> e.probeType == (firstValidation | ValidationProbeEvent.PROBE_DNS)
+                        && e.returnCode == ValidationProbeEvent.DNS_SUCCESS
+                        && e.durationMs >= 1L && e.durationMs < 1000L);
+        // The first probe has to be DNS, but then the order of the next DNS probe and HTTP/HTTPS
+        // probes is unknown.
+        final int httpProbesStartIndex = 2;
+        assertHasEvent(msg, ValidationProbeEvent.class, events, httpProbesStartIndex,
+                e -> e.probeType == (firstValidation | ValidationProbeEvent.PROBE_DNS)
+                        && e.returnCode == ValidationProbeEvent.DNS_SUCCESS
+                        && e.durationMs >= 1L && e.durationMs < 1000L);
+
+        final int httpsProbeIndex = assertHasEvent(msg, ValidationProbeEvent.class, events,
+                httpProbesStartIndex,
+                e -> e.probeType == (firstValidation | ValidationProbeEvent.PROBE_HTTPS)
+                        && e.returnCode == 204);
+
+        assertHasEvent(msg, ValidationProbeEvent.class, events, httpProbesStartIndex,
+                e -> e.probeType == (firstValidation | ValidationProbeEvent.PROBE_HTTP)
+                        && e.returnCode == 204);
+
+        // Private DNS starts after validation, so at least after the HTTPS probe
+        final int privDnsIndex = assertHasEvent(msg, ValidationProbeEvent.class, events,
+                httpsProbeIndex + 1,
+                e -> e.probeType == (firstValidation | ValidationProbeEvent.PROBE_PRIVDNS)
+                        && e.returnCode == ValidationProbeEvent.DNS_SUCCESS
+                        && e.durationMs >= 1L && e.durationMs < 1000L);
+
+        assertHasEvent(msg, NetworkEvent.class, events, privDnsIndex + 1,
+                e -> e.eventType == NetworkEvent.NETWORK_FIRST_VALIDATION_SUCCESS);
+    }
+
+    private static <T> int assertHasEvent(String msg, Class<T> clazz,
+            List<IpConnectivityLog.Event> events, int startIdx,
+            Predicate<T> predicate) {
+        for (int i = startIdx; i < events.size(); i++) {
+            if (events.get(i).getClass().isAssignableFrom(clazz)
+                    && predicate.test((T) events.get(i))) {
+                return i;
+            }
+        }
+        fail(msg + " at startIdx " + startIdx);
+        return -1;
+    }
+
+    @Test
+    public void testLegacyConnectivityLog_SyncDns() throws Exception {
+        doReturn(false).when(mDependencies).isFeatureEnabled(
+                any(), eq(NETWORKMONITOR_ASYNC_PRIVDNS_RESOLUTION));
+        doLegacyConnectivityLogTest();
+    }
+
+    @Test
+    public void testLegacyConnectivityLog_AsyncDns() throws Exception {
+        doReturn(true).when(mDependencies).isFeatureEnabled(
+                any(), eq(NETWORKMONITOR_ASYNC_PRIVDNS_RESOLUTION));
+        doLegacyConnectivityLogTest();
     }
 
     @Test
@@ -3344,11 +3823,33 @@ public class NetworkMonitorTest {
         return argThat(p -> (p.detectionMethod & ConstantsShim.DETECTION_METHOD_TCP_METRICS) != 0);
     }
 
+    private PrivateDnsConfigParcel matchPrivateDnsConfigParcelWithDohOnly(String dohName,
+            String[] dohIps, String dohPath, int dohPort) {
+        return matchPrivateDnsConfigParcel("", new String[0], dohName, dohIps, dohPath, dohPort);
+    }
+
+    private PrivateDnsConfigParcel matchPrivateDnsConfigParcelWithDotOnly(String hostname,
+            String[] dotIps) {
+        return matchPrivateDnsConfigParcel(hostname, dotIps, "", new String[0], "", -1);
+    }
+
+    private PrivateDnsConfigParcel matchPrivateDnsConfigParcel(String hostname,
+            String[] dotIps, String dohName, String[] dohIps, String dohPath, int dohPort) {
+        final int mode = TextUtils.isEmpty(hostname)
+                ? PRIVATE_DNS_MODE_OPPORTUNISTIC : PRIVATE_DNS_MODE_PROVIDER_HOSTNAME;
+        return argThat(p -> (p.privateDnsMode == mode && p.hostname.equals(hostname)
+                && Arrays.equals(p.ips, dotIps) && p.dohName.equals(dohName)
+                && p.dohPath.equals(dohPath) && Arrays.equals(p.dohIps, dohIps)
+                && p.dohPort == dohPort));
+    }
+
     private void assertCaptivePortalAppReceiverRegistered(boolean isPortal) {
         // There will be configuration change receiver registered after NetworkMonitor being
         // started. If captive portal app receiver is registered, then the size of the registered
         // receivers will be 2. Otherwise, mRegisteredReceivers should only contain 1 configuration
         // change receiver.
-        assertEquals(isPortal ? 2 : 1, mRegisteredReceivers.size());
+        synchronized (mRegisteredReceivers) {
+            assertEquals(isPortal ? 2 : 1, mRegisteredReceivers.size());
+        }
     }
 }

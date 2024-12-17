@@ -32,6 +32,7 @@ import android.net.ipmemorystore.Blob;
 import android.net.ipmemorystore.IOnBlobRetrievedListener;
 import android.net.ipmemorystore.IOnL2KeyResponseListener;
 import android.net.ipmemorystore.IOnNetworkAttributesRetrievedListener;
+import android.net.ipmemorystore.IOnNetworkEventCountRetrievedListener;
 import android.net.ipmemorystore.IOnSameL3NetworkResponseListener;
 import android.net.ipmemorystore.IOnStatusAndCountListener;
 import android.net.ipmemorystore.IOnStatusListener;
@@ -86,6 +87,9 @@ public class IpMemoryStoreService extends IIpMemoryStore.Stub {
      * @param context the context to access storage with.
      */
     public IpMemoryStoreService(@NonNull final Context context) {
+        // Before doing anything at all, rename the legacy database if necessary.
+        IpMemoryStoreDatabase.DbHelper.maybeRenameDatabaseFile(context);
+
         // Note that constructing the service will access the disk and block
         // for some time, but it should make no difference to the clients. Because
         // the interface is one-way, clients fire and forget requests, and the callback
@@ -424,6 +428,12 @@ public class IpMemoryStoreService extends IIpMemoryStore.Stub {
             @Nullable final IOnStatusAndCountListener listener) {
         mExecutor.execute(() -> {
             try {
+                if (null == mDb) {
+                    if (null != listener) {
+                        listener.onComplete(makeStatus(ERROR_DATABASE_CANNOT_BE_OPENED), 0);
+                    }
+                    return;
+                }
                 final StatusAndCount res = IpMemoryStoreDatabase.delete(mDb, l2Key, needWipe);
                 if (null != listener) listener.onComplete(makeStatus(res.status), res.count);
             } catch (final RemoteException e) {
@@ -450,6 +460,12 @@ public class IpMemoryStoreService extends IIpMemoryStore.Stub {
             @Nullable final IOnStatusAndCountListener listener) {
         mExecutor.execute(() -> {
             try {
+                if (null == mDb) {
+                    if (null != listener) {
+                        listener.onComplete(makeStatus(ERROR_DATABASE_CANNOT_BE_OPENED), 0);
+                    }
+                    return;
+                }
                 final StatusAndCount res =
                         IpMemoryStoreDatabase.deleteCluster(mDb, cluster, needWipe);
                 if (null != listener) listener.onComplete(makeStatus(res.status), res.count);
@@ -464,7 +480,106 @@ public class IpMemoryStoreService extends IIpMemoryStore.Stub {
      */
     @Override
     public void factoryReset() {
-        mExecutor.execute(() -> IpMemoryStoreDatabase.wipeDataUponNetworkReset(mDb));
+        mExecutor.execute(() -> {
+            if (null == mDb) {
+                return;
+            }
+            IpMemoryStoreDatabase.wipeDataUponNetworkReset(mDb);
+        });
+    }
+
+    /**
+     * Retrieve the specific network event counts for a given cluster and event type since one or
+     * more timestamps in the past.
+     *
+     * @param cluster The cluster to query.
+     * @param sinceTimes An array of timestamps in the past. The query will return an array of
+     *                   equal size. Each element in the array will contain the number of network
+     *                   events between the corresponding timestamp and the current time, e.g. query
+     *                   since the last week and/or the last day.
+     * @param eventTypes An array of network event types to query, which can be one or more of the
+     *                   above NETWORK_EVENT constants.
+     * @param listener The listener that will be invoked to return the answer.
+     * returns (through the listener) The event counts associated with the query, or an empty array
+     *                                if the query failed.
+     */
+    @Override
+    public void retrieveNetworkEventCount(@NonNull final String cluster,
+            @NonNull final long[] sinceTimes,
+            @NonNull final int[] eventTypes,
+            @Nullable final IOnNetworkEventCountRetrievedListener listener) {
+        if (null == listener) return;
+        mExecutor.execute(() -> {
+            try {
+                if (null == cluster) {
+                    listener.onNetworkEventCountRetrieved(
+                            makeStatus(ERROR_ILLEGAL_ARGUMENT), new int[0] /* counts */);
+                    return;
+                }
+                if (0 == sinceTimes.length) {
+                    listener.onNetworkEventCountRetrieved(
+                            makeStatus(ERROR_ILLEGAL_ARGUMENT), new int[0] /* counts */);
+                    return;
+                }
+                if (null == mDb) {
+                    listener.onNetworkEventCountRetrieved(
+                            makeStatus(ERROR_DATABASE_CANNOT_BE_OPENED), new int[0] /* counts */);
+                    return;
+                }
+                try {
+                    final int[] counts = IpMemoryStoreDatabase.retrieveNetworkEventCount(mDb,
+                            cluster, sinceTimes, eventTypes);
+                    listener.onNetworkEventCountRetrieved(makeStatus(SUCCESS), counts);
+                } catch (final Exception e) {
+                    listener.onNetworkEventCountRetrieved(makeStatus(ERROR_GENERIC),
+                            new int[0] /* counts */);
+                }
+            } catch (final RemoteException e) {
+                // Client at the other end died
+            }
+        });
+    }
+
+    /**
+     * Store a specific network event to database for a given cluster.
+     *
+     * @param cluster The cluster representing a notion of network group (e.g., BSSIDs with the
+     *                same SSID).
+     * @param timestamp The timestamp {@link System.currentTimeMillis} when a specific network
+     *                  event occurred.
+     * @param expiry The timestamp {@link System.currentTimeMillis} when a specific network
+     *               event stored in the database expires, e.g. it might be one week from now.
+     * @param eventType One of the NETWORK_EVENT constants above.
+     * @param listener A listener that will be invoked to inform of the completion of this call.
+     * returns (through the listener) A status to indicate success or failure.
+     */
+    @Override
+    public void storeNetworkEvent(@NonNull final String cluster,
+            final long timestamp,
+            final long expiry,
+            final int eventType,
+            @Nullable final IOnStatusListener listener) {
+        mExecutor.execute(() -> {
+            try {
+                if (null == cluster) {
+                    listener.onComplete(makeStatus(ERROR_ILLEGAL_ARGUMENT));
+                    return;
+                }
+                if (null == mDb) {
+                    listener.onComplete(makeStatus(ERROR_DATABASE_CANNOT_BE_OPENED));
+                    return;
+                }
+                try {
+                    final int code = IpMemoryStoreDatabase.storeNetworkEvent(mDb, cluster,
+                            timestamp, expiry, eventType);
+                    if (null != listener) listener.onComplete(makeStatus(code));
+                } catch (final Exception e) {
+                    if (null != listener) listener.onComplete(makeStatus(ERROR_GENERIC));
+                }
+            } catch (final RemoteException e) {
+                // Client at the other end died
+            }
+        });
     }
 
     /** Get db size threshold. */
@@ -474,6 +589,9 @@ public class IpMemoryStoreService extends IIpMemoryStore.Stub {
     }
 
     private long getDbSize() {
+        if (null == mDb) {
+            return 0;
+        }
         final File dbFile = new File(mDb.getPath());
         try {
             return dbFile.length();
